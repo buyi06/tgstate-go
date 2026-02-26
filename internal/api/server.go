@@ -190,8 +190,9 @@ func setupRoutes(r *gin.Engine, sseHub *SSEHub) {
 		api.POST("/auth/login", loginAPI)
 		api.POST("/auth/logout", logoutAPI)
 
-		// 公开 API - 设置密码不需要认证
+		// 公开 API - 欢迎页设置需要
 		api.POST("/set-password", setPasswordAPI)
+		api.POST("/app-config", setConfigAPI)
 
 		// 认证 API
 		protected := api.Group("")
@@ -202,7 +203,6 @@ func setupRoutes(r *gin.Engine, sseHub *SSEHub) {
 			protected.POST("/batch_delete", batchDeleteAPI)
 			protected.POST("/upload", uploadAPI)
 			protected.GET("/app-config", getConfigAPI)
-			protected.POST("/app-config", setConfigAPI)
 			protected.POST("/reset-config", resetConfigAPI)
 		}
 
@@ -319,11 +319,23 @@ document.getElementById('login-form').onsubmit = async (e) => {
 func welcomePage(c *gin.Context) {
 	content := `<div class="card">
     <h2>欢迎使用 tgState Go</h2>
-    <p>首次使用，请设置管理员密码</p>
+    <p>首次使用，请完成以下配置</p>
     <form id="welcome-form" style="margin-top: 20px;">
         <div class="form-group">
-            <label>设置密码</label>
-            <input type="password" name="password" required>
+            <label>管理员密码 *</label>
+            <input type="password" name="password" required placeholder="设置管理后台密码">
+        </div>
+        <div class="form-group">
+            <label>Bot Token *</label>
+            <input type="text" name="bot_token" required placeholder="从 @BotFather 获取">
+        </div>
+        <div class="form-group">
+            <label>频道 ID *</label>
+            <input type="text" name="channel_name" required placeholder="-1001234567890">
+        </div>
+        <div class="form-group">
+            <label>Base URL (可选)</label>
+            <input type="text" name="base_url" placeholder="https://pan.example.com">
         </div>
         <button type="submit" class="btn">开始使用</button>
     </form>
@@ -332,16 +344,34 @@ func welcomePage(c *gin.Context) {
 document.getElementById('welcome-form').onsubmit = async (e) => {
     e.preventDefault();
     const formData = new FormData(e.target);
-    const res = await fetch('/api/set-password', {
+    const password = formData.get('password');
+    const bot_token = formData.get('bot_token');
+    const channel_name = formData.get('channel_name');
+    const base_url = formData.get('base_url');
+    
+    // 先设置密码
+    const res1 = await fetch('/api/set-password', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({password: formData.get('password')})
+        body: JSON.stringify({password})
     });
-    const data = await res.json();
-    if (data.code === 'success') {
-        location.href = '/settings';
+    const data1 = await res1.json();
+    if (data1.code !== 'success') {
+        alert(data1.message || '设置密码失败');
+        return;
+    }
+    
+    // 再设置配置
+    const res2 = await fetch('/api/app-config', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({bot_token, channel_name, base_url})
+    });
+    const data2 = await res2.json();
+    if (data2.code === 'success') {
+        location.href = '/';
     } else {
-        alert(data.message);
+        alert(data2.message || '配置失败');
     }
 };
 </script>`

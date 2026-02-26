@@ -34,8 +34,12 @@ func main() {
 
 	// 启动 Telegram Bot
 	cfg := config.Get()
+	tgBot := bot.NewBot(cfg.BotToken, cfg.ChannelName)
+	
+	// 设置全局 Bot 实例
+	api.SetBot(tgBot)
+	
 	go func() {
-		tgBot := bot.NewBot(cfg.BotToken)
 		if err := tgBot.Start(); err != nil {
 			log.Printf("Bot error: %v", err)
 		}

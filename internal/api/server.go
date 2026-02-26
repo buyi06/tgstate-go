@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"tgstate-go/internal/bot"
 	"tgstate-go/internal/config"
 	"tgstate-go/internal/database"
 	"tgstate-go/internal/models"
@@ -303,6 +304,14 @@ func imageHostingPage(c *gin.Context) {
 	})
 }
 
+// 全局 Bot 实例
+var tgBot *bot.Bot
+
+// SetBot 设置全局 Bot 实例
+func SetBot(b *bot.Bot) {
+	tgBot = b
+}
+
 func downloadPage(c *gin.Context) {
 	shortID := c.Param("short_id")
 	_ = c.Param("filepath")
@@ -329,14 +338,53 @@ func downloadPage(c *gin.Context) {
 
 	// Range 请求支持
 	rangeHeader := c.GetHeader("Range")
-	if rangeHeader != "" {
-		// TODO: 实现 Range 请求从 Telegram 下载
-		c.Header("Content-Range", fmt.Sprintf("bytes 0-%d/%d", file.Filesize-1, file.Filesize))
+	if rangeHeader != "" && tgBot != nil {
+		// 处理 Range 请求
+		parts := strings.Split(strings.TrimPrefix(rangeHeader, "bytes="), "-")
+		start, _ := strconv.ParseInt(parts[0], 10, 64)
+		end := file.Filesize - 1
+		if len(parts) > 1 && parts[1] != "" {
+			end, _ = strconv.ParseInt(parts[1], 10, 64)
+		}
+		
+		// 从 Telegram 获取文件（需要支持 Range）
+		// 暂时返回全部内容
+		fileData, err := tgBot.DownloadFile(file.FileID)
+		if err != nil {
+			log.Printf("Failed to download file from Telegram: %v", err)
+			c.String(http.StatusInternalServerError, "下载失败")
+			return
+		}
+		
+		// 发送部分内容
+		c.Header("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, file.Filesize))
+		c.Header("Content-Length", strconv.FormatInt(end-start+1, 10))
 		c.Status(http.StatusPartialContent)
+		
+		if start > 0 && int(start) < len(fileData) {
+			if end >= int64(len(fileData)) {
+				end = int64(len(fileData)) - 1
+			}
+			c.Data(http.StatusOK, contentType, fileData[start:end+1])
+		} else {
+			c.Data(http.StatusOK, contentType, fileData)
+		}
+		return
 	}
 
-	// TODO: 从 Telegram 获取文件
-	c.String(http.StatusOK, "文件下载功能开发中")
+	// 完整文件下载
+	if tgBot != nil {
+		fileData, err := tgBot.DownloadFile(file.FileID)
+		if err != nil {
+			log.Printf("Failed to download file from Telegram: %v", err)
+			c.String(http.StatusInternalServerError, "下载失败")
+			return
+		}
+		c.Data(http.StatusOK, contentType, fileData)
+	} else {
+		// 如果没有 Bot 实例，返回提示
+		c.String(http.StatusOK, "文件ID: %s\n请配置 Telegram Bot", file.FileID)
+	}
 }
 
 // API 处理函数

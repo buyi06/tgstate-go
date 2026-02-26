@@ -1,0 +1,70 @@
+name: Build and Release
+
+on:
+  push:
+    branches: [main]
+  release:
+    types: [created]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+      
+      - name: Build
+        run: |
+          go mod download
+          go build -ldflags="-s -w" -o tgstate ./cmd/server
+      
+      - name: Upload Release Asset
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: tgstate
+          draft: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Upload to Release
+        uses: actions/upload-artifact@v4
+        with:
+          name: tgstate-linux-amd64
+          path: tgstate
+          retention-days: 30
+
+  # Build for other platforms
+  build-all:
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        goos: [linux, darwin]
+        goarch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+      
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          go mod download
+          go build -ldflags="-s -w" -o tgstate-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/server
+      
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tgstate-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: tgstate-${{ matrix.goos }}-${{ matrix.goarch }}

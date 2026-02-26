@@ -3,12 +3,17 @@ package api
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"html/template"
+	"io"
+	"log"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"tgstate-go/internal/config"
@@ -20,8 +25,43 @@ import (
 )
 
 type Server struct {
-	router *gin.Engine
-	server *http.Server
+	router  *gin.Engine
+	server  *http.Server
+	sseHub  *SSEHub
+}
+
+type SSEHub struct {
+	clients map[chan []byte]bool
+	mutex   sync.RWMutex
+}
+
+func NewSSEHub() *SSEHub {
+	return &SSEHub{
+		clients: make(map[chan []byte]bool),
+	}
+}
+
+func (h *SSEHub) Register(client chan []byte) {
+	h.mutex.Lock()
+	defer h.mutex.Unlock()
+	h.clients[client] = true
+}
+
+func (h *SSEHub) Unregister(client chan []byte) {
+	h.mutex.Lock()
+	defer h.mutex.Unlock()
+	delete(h.clients, client)
+}
+
+func (h *SSEHub) Broadcast(message []byte) {
+	h.mutex.RLock()
+	defer h.mutex.RUnlock()
+	for client := range h.clients {
+		select {
+		case client <- message:
+		default:
+		}
+	}
 }
 
 func NewServer() *Server {
@@ -51,14 +91,18 @@ func NewServer() *Server {
 	// 静态文件
 	r.Static("/static", "./web/static")
 
-	// 模板
-	r.SetHTMLTemplate(htmlTemplate())
+	// 加载模板
+	r.SetHTMLTemplate(loadTemplates())
+
+	// SSE Hub
+	sseHub := NewSSEHub()
 
 	// 路由
-	setupRoutes(r)
+	setupRoutes(r, sseHub)
 
 	server := &Server{
 		router: r,
+		sseHub: sseHub,
 		server: &http.Server{
 			Addr:    ":8000",
 			Handler: r,
@@ -68,19 +112,72 @@ func NewServer() *Server {
 	return server
 }
 
+func loadTemplates() *template.Template {
+	funcs := template.FuncMap{
+		"split":   strings.Split,
+		"splitN":  func(s, sep string, n int) []string { return strings.SplitN(s, sep, n) },
+		"replace": strings.ReplaceAll,
+		"json": func(v interface{}) template.JS {
+			b, _ := json.Marshal(v)
+			return template.JS(b)
+		},
+	}
+
+	// 加载所有模板文件
+	templateDir := "web/templates"
+	templateNames := []string{
+		"base.html",
+		"index.html",
+		"settings.html",
+		"image_hosting.html",
+		"welcome.html",
+		"download.html",
+		"pwd.html",
+	}
+
+	var tmpl *template.Template
+	for i, name := range templateNames {
+		var err error
+		content, err := os.ReadFile(templateDir + "/" + name)
+		if err != nil {
+			log.Printf("Warning: could not read template %s: %v", name, err)
+			continue
+		}
+		if i == 0 {
+			tmpl, err = template.New(name).Funcs(funcs).Parse(string(content))
+		} else {
+			tmpl, err = tmpl.New(name).Parse(string(content))
+		}
+		if err != nil {
+			log.Printf("Warning: could not parse template %s: %v", name, err)
+		}
+	}
+
+	return tmpl
+}
+
+func init() {
+	// 这个在运行时会被替换
+}
+
 func (s *Server) Run(addr string) error {
 	s.server.Addr = addr
 	return s.server.ListenAndServe()
 }
 
-func setupRoutes(r *gin.Engine) {
+func setupRoutes(r *gin.Engine, sseHub *SSEHub) {
 	// 页面路由
 	r.GET("/", authMiddleware(), homePage)
 	r.GET("/login", loginPage)
+	r.GET("/pwd", loginPage)
 	r.GET("/files", authMiddleware(), filesPage)
 	r.GET("/settings", authMiddleware(), settingsPage)
 	r.GET("/welcome", welcomePage)
 	r.GET("/image_hosting", authMiddleware(), imageHostingPage)
+	r.GET("/d/:short_id/*filepath", downloadPage)
+	r.GET("/f/:short_id", func(c *gin.Context) {
+		c.Redirect(http.StatusTemporaryRedirect, "/d/"+c.Param("short_id"))
+	})
 
 	// API 路由
 	api := r.Group("/api")
@@ -95,19 +192,18 @@ func setupRoutes(r *gin.Engine) {
 		{
 			protected.GET("/files", getFilesAPI)
 			protected.DELETE("/files/:short_id", deleteFileAPI)
+			protected.POST("/batch_delete", batchDeleteAPI)
 			protected.POST("/upload", uploadAPI)
 			protected.GET("/app-config", getConfigAPI)
 			protected.POST("/app-config", setConfigAPI)
 			protected.POST("/set-password", setPasswordAPI)
+			protected.POST("/reset-config", resetConfigAPI)
+			protected.GET("/image_hosting", imageHostingAPI)
 		}
 
-		// 公开下载
-		r.GET("/d/:short_id/*filepath", downloadPage)
-		r.GET("/f/:short_id", fileAPI)
+		// SSE
+		api.GET("/sse", sseAPI(sseHub))
 	}
-
-	// SSE
-	r.GET("/api/sse", sseAPI)
 }
 
 // 中间件
@@ -117,9 +213,11 @@ func authMiddleware() gin.HandlerFunc {
 		password, err := database.GetPassword()
 		if err != nil || password == "" {
 			if c.FullPath() != "/welcome" && 
+			   c.FullPath() != "/pwd" &&
 			   !strings.HasPrefix(c.FullPath(), "/api/auth") &&
 			   !strings.HasPrefix(c.FullPath(), "/static") &&
-			   !strings.HasPrefix(c.FullPath(), "/d/") {
+			   !strings.HasPrefix(c.FullPath(), "/d/") &&
+			   !strings.HasPrefix(c.FullPath(), "/f/") {
 				c.Redirect(http.StatusTemporaryRedirect, "/welcome")
 				c.Abort()
 				return
@@ -129,7 +227,7 @@ func authMiddleware() gin.HandlerFunc {
 		}
 
 		// 已设置密码，检查登录
-		if c.FullPath() == "/welcome" || c.FullPath() == "/login" {
+		if c.FullPath() == "/welcome" || c.FullPath() == "/pwd" || c.FullPath() == "/login" {
 			c.Next()
 			return
 		}
@@ -158,41 +256,87 @@ func authMiddleware() gin.HandlerFunc {
 
 // 页面处理函数
 func homePage(c *gin.Context) {
+	files, _ := database.GetAllFiles()
+	cfg := config.Get()
+	
+	c.HTML(http.StatusOK, "base.html", gin.H{
+		"Request": c.Request,
+		"files":   files,
+		"cfg":     cfg,
+	})
+}
+
+func filesPage(c *gin.Context) {
+	files, _ := database.GetAllFiles()
+	cfg := config.Get()
+	
 	c.HTML(http.StatusOK, "index.html", gin.H{
-		"title": "tgState - 文件管理",
+		"Request": c.Request,
+		"files":   files,
+		"cfg":     cfg,
 	})
 }
 
 func loginPage(c *gin.Context) {
-	c.HTML(http.StatusOK, "login.html", gin.H{
-		"title": "登录 - tgState",
+	c.HTML(http.StatusOK, "pwd.html", gin.H{
+		"Request": c.Request,
 	})
 }
 
 func welcomePage(c *gin.Context) {
 	c.HTML(http.StatusOK, "welcome.html", gin.H{
-		"title": "欢迎 - tgState",
-	})
-}
-
-func filesPage(c *gin.Context) {
-	c.HTML(http.StatusOK, "files.html", gin.H{
-		"title": "文件列表 - tgState",
+		"Request": c.Request,
 	})
 }
 
 func settingsPage(c *gin.Context) {
 	cfg := config.Get()
 	c.HTML(http.StatusOK, "settings.html", gin.H{
-		"title":  "设置 - tgState",
-		"config": cfg,
+		"Request": c.Request,
+		"config":  cfg,
 	})
 }
 
 func imageHostingPage(c *gin.Context) {
 	c.HTML(http.StatusOK, "image_hosting.html", gin.H{
-		"title": "图床 - tgState",
+		"Request": c.Request,
 	})
+}
+
+func downloadPage(c *gin.Context) {
+	shortID := c.Param("short_id")
+	_ = c.Param("filepath")
+
+	file, err := database.GetFileByShortID(shortID)
+	if err != nil {
+		c.String(http.StatusNotFound, "文件不存在")
+		return
+	}
+
+	download := c.Query("download") == "1"
+	
+	// 设置响应头
+	contentType := getContentType(file.Filename)
+	if download || !isInlineContentType(contentType) {
+		c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%s", urlEncode(file.Filename)))
+	} else {
+		c.Header("Content-Disposition", "inline")
+	}
+	
+	c.Header("Content-Type", contentType)
+	c.Header("Content-Length", strconv.FormatInt(file.Filesize, 10))
+	c.Header("Accept-Ranges", "bytes")
+
+	// Range 请求支持
+	rangeHeader := c.GetHeader("Range")
+	if rangeHeader != "" {
+		// TODO: 实现 Range 请求从 Telegram 下载
+		c.Header("Content-Range", fmt.Sprintf("bytes 0-%d/%d", file.Filesize-1, file.Filesize))
+		c.Status(http.StatusPartialContent)
+	}
+
+	// TODO: 从 Telegram 获取文件
+	c.String(http.StatusOK, "文件下载功能开发中")
 }
 
 // API 处理函数
@@ -247,6 +391,22 @@ func deleteFileAPI(c *gin.Context) {
 	c.JSON(http.StatusOK, models.Success(nil))
 }
 
+func batchDeleteAPI(c *gin.Context) {
+	var req struct {
+		FileIDs []string `json:"file_ids"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, models.Error("参数错误", "invalid_input"))
+		return
+	}
+
+	for _, shortID := range req.FileIDs {
+		database.DeleteFileByShortID(shortID)
+	}
+
+	c.JSON(http.StatusOK, models.Success(nil))
+}
+
 func uploadAPI(c *gin.Context) {
 	file, header, err := c.Request.FormFile("file")
 	if err != nil {
@@ -255,10 +415,17 @@ func uploadAPI(c *gin.Context) {
 	}
 	defer file.Close()
 
-	_ = header // 暂时不用
+	// 读取文件内容
+	fileData, err := io.ReadAll(file)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, models.Error("读取文件失败", "error"))
+		return
+	}
 
-	// 这里需要通过 Bot 上传到 Telegram
-	// 暂时返回错误
+	// TODO: 通过 Bot 上传到 Telegram
+	_ = header
+	_ = fileData
+
 	c.JSON(http.StatusNotImplemented, models.Error("请通过 Telegram 频道上传文件", "not_implemented"))
 }
 
@@ -267,7 +434,7 @@ func getConfigAPI(c *gin.Context) {
 	c.JSON(http.StatusOK, models.Success(map[string]string{
 		"bot_token":    maskToken(cfg.BotToken),
 		"channel_name": cfg.ChannelName,
-		"base_url":    cfg.BaseURL,
+		"base_url":     cfg.BaseURL,
 	}))
 }
 
@@ -284,12 +451,15 @@ func setConfigAPI(c *gin.Context) {
 
 	if req.BotToken != "" {
 		config.Get().BotToken = req.BotToken
+		database.SetSetting("bot_token", req.BotToken)
 	}
 	if req.ChannelName != "" {
 		config.Get().ChannelName = req.ChannelName
+		database.SetSetting("channel_name", req.ChannelName)
 	}
 	if req.BaseURL != "" {
 		config.Get().BaseURL = req.BaseURL
+		database.SetSetting("base_url", req.BaseURL)
 	}
 
 	c.JSON(http.StatusOK, models.Success(nil))
@@ -317,48 +487,62 @@ func setPasswordAPI(c *gin.Context) {
 	c.JSON(http.StatusOK, models.Success(nil))
 }
 
-func downloadPage(c *gin.Context) {
-	shortID := c.Param("short_id")
-	filepath := c.Param("filepath")
-	filepath = strings.TrimPrefix(filepath, "/")
+func resetConfigAPI(c *gin.Context) {
+	database.SetSetting("bot_token", "")
+	database.SetSetting("channel_name", "")
+	database.SetSetting("base_url", "")
+	database.SetSetting("password", "")
+	
+	c.SetCookie("tgstate_session", "", -1, "/", "", false, true)
+	
+	c.JSON(http.StatusOK, models.Success(nil))
+}
 
-	file, err := database.GetFileByShortID(shortID)
+func imageHostingAPI(c *gin.Context) {
+	// 获取图片文件用于图床
+	files, err := database.GetAllFiles()
 	if err != nil {
-		c.String(http.StatusNotFound, "文件不存在")
+		c.JSON(http.StatusInternalServerError, models.Error("获取文件列表失败", "error"))
 		return
 	}
-
-	download := c.Query("download") == "1"
 	
-	// 设置响应头
-	contentType := getContentType(file.Filename)
-	if download || !isInlineContentType(contentType) {
-		c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%s", urlEncode(file.Filename)))
-	} else {
-		c.Header("Content-Disposition", "inline")
+	// 过滤图片文件
+	var imageFiles []models.FileMetadata
+	imageExts := []string{".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg"}
+	for _, f := range files {
+		ext := strings.ToLower(filepath.Ext(f.Filename))
+		for _, imgExt := range imageExts {
+			if ext == imgExt {
+				imageFiles = append(imageFiles, f)
+				break
+			}
+		}
 	}
 	
-	c.Header("Content-Type", contentType)
-	c.Header("Content-Length", strconv.FormatInt(file.Filesize, 10))
-	c.Header("Accept-Ranges", "bytes")
-
-	// TODO: 从 Telegram 获取文件
-	c.String(http.StatusOK, "文件下载功能开发中")
+	c.JSON(http.StatusOK, models.Success(imageFiles))
 }
 
-func fileAPI(c *gin.Context) {
-	shortID := c.Param("short_id")
-	c.Redirect(http.StatusTemporaryRedirect, "/d/"+shortID)
-}
+func sseAPI(hub *SSEHub) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Header("Content-Type", "text/event-stream")
+		c.Header("Cache-Control", "no-cache")
+		c.Header("Connection", "keep-alive")
+		c.Header("Access-Control-Allow-Origin", "*")
 
-func sseAPI(c *gin.Context) {
-	c.Header("Content-Type", "text/event-stream")
-	c.Header("Cache-Control", "no-cache")
-	c.Header("Connection", "keep-alive")
+		client := make(chan []byte)
+		hub.Register(client)
+		defer hub.Unregister(client)
 
-	// TODO: 实现 SSE
-	c.SSEvent("message", map[string]string{"status": "ok"})
-	c.Writer.Flush()
+		c.Stream(func(w io.Writer) bool {
+			select {
+			case msg := <-client:
+				c.SSEvent("message", msg)
+				return true
+			case <-c.Request.Context().Done():
+				return false
+			}
+		})
+	}
 }
 
 func urlEncode(filename string) string {
@@ -423,26 +607,4 @@ func maskToken(token string) string {
 		return "***"
 	}
 	return "***" + token[len(token)-10:]
-}
-
-// HTML 模板
-func htmlTemplate() *template.Template {
-	html := `
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{{.title}}</title>
-    <link rel="stylesheet" href="/static/css/style.css">
-</head>
-<body>
-    <div class="container">
-        {{.content}}
-    </div>
-    <script src="/static/js/app.js"></script>
-</body>
-</html>
-	`
-	return template.Must(template.New("html").Parse(html))
 }
